@@ -34,6 +34,7 @@ Permanent authentication, configuration, or context errors may continue retrying
 - Exponential backoff: `1s -> 2s -> 4s -> ...`, capped at `60s`
 - Honors `providerRetryAfterMs` when available, also capped at `60s`
 - Logs the provider, error code, turn, step, retry count, and delay
+- Emits standard `llm/retry` events so the Harness conversation UI shows the continuous retry count, `∞` limit, countdown, and failure reason
 - Stops when the current turn is aborted or the plugin is stopped
 
 ### Download
@@ -135,6 +136,7 @@ Restart DSH after installing a persistent plugin package.
 - 指数退避: `1s -> 2s -> 4s -> ...`,最长等待 `60s`
 - 如果服务端提供 `providerRetryAfterMs`,优先使用该等待时间,同样封顶 `60s`
 - 记录 Provider、错误码、回合、步骤、重试次数和等待时间
+- 写入标准 `llm/retry` 事件,Harness 会话界面显示连续重试次数、`∞`、倒计时和错误原因
 - 用户停止回合或插件停止后立即停止重试
 
 ### 下载方式
