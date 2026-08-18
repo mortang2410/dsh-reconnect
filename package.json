@@ -1,6 +1,6 @@
 {
   "name": "dsh-reconnect",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Infinite model-request retry for DeepSeek Harness with exponential backoff and relay/proxy failure recovery.",
   "type": "module",
   "main": "src/index.js",
