@@ -36,13 +36,68 @@ Permanent authentication, configuration, or context errors may continue retrying
 - Logs the provider, error code, turn, step, retry count, and delay
 - Stops when the current turn is aborted or the plugin is stopped
 
-### Installation
+### Download
+
+The package is platform-independent. Choose one of the following methods.
+
+#### Method 1: GitHub Web Download
+
+1. Open https://github.com/MistRain-1/dsh-reconnect.
+2. Select **Code** and then **Download ZIP**.
+3. Extract the archive and use the extracted `dsh-reconnect-main` directory as the plugin package.
+
+#### Method 2: Git Clone
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME\dsh-reconnect"
+```
+
+macOS:
+
+```bash
+git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME/dsh-reconnect"
+```
+
+Linux:
+
+```bash
+git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME/dsh-reconnect"
+```
+
+#### Method 3: Download the ZIP from a Terminal
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest -Uri https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -OutFile dsh-reconnect.zip
+Expand-Archive -Path dsh-reconnect.zip -DestinationPath .
+```
+
+macOS:
+
+```bash
+curl -L https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -o dsh-reconnect.zip
+unzip dsh-reconnect.zip
+```
+
+Linux:
+
+```bash
+wget https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -O dsh-reconnect.zip
+unzip dsh-reconnect.zip
+```
+
+After downloading, register the package in the DSH Cordis composition:
 
 ```yaml
 - insert:
     - id: reconnect
       name: dsh-reconnect
 ```
+
+Restart DSH after installing a persistent plugin package.
 
 ### Runtime Requirements
 
@@ -82,13 +137,74 @@ Permanent authentication, configuration, or context errors may continue retrying
 - 记录 Provider、错误码、回合、步骤、重试次数和等待时间
 - 用户停止回合或插件停止后立即停止重试
 
-### 安装
+### 下载方式
+
+本插件与操作系统无关,可以选择以下任意一种方式下载。
+
+#### 方式一:GitHub 网页下载
+
+1. 打开 https://github.com/MistRain-1/dsh-reconnect。
+2. 点击 **Code**,再点击 **Download ZIP**。
+3. 解压后,将 `dsh-reconnect-main` 目录作为插件包使用。
+
+#### 方式二:Git 克隆
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME\dsh-reconnect"
+```
+
+macOS:
+
+```bash
+git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME/dsh-reconnect"
+```
+
+Linux:
+
+```bash
+git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME/dsh-reconnect"
+```
+
+#### 方式三:命令行下载 ZIP
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest -Uri https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -OutFile dsh-reconnect.zip
+Expand-Archive -Path dsh-reconnect.zip -DestinationPath .
+```
+
+macOS:
+
+```bash
+curl -L https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -o dsh-reconnect.zip
+unzip dsh-reconnect.zip
+```
+
+Linux:
+
+```bash
+wget https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -O dsh-reconnect.zip
+unzip dsh-reconnect.zip
+```
+
+下载完成后,将插件加入 DSH 的 Cordis 组合:
 
 ```yaml
 - insert:
     - id: reconnect
       name: dsh-reconnect
 ```
+
+安装持久插件包后需要重启 DSH。
+
+### 运行要求
+
+- DSH Host 端插件
+- 使用 `timer` Service 和 `agent/request-error` 瀑布事件
+- 无 Client 端 UI,不发起额外外部网络请求,不读取凭据
 
 ## License
 
