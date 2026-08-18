@@ -1,0 +1,12 @@
+# dsh-reconnect 补丁:向 profile 插入 reconnect 行。
+#
+# Host half (src/index.js):
+#   - 监听 `agent/request-error` 瀑布事件(每次模型请求失败都会触发);
+#   - 在瀑布末端兜底:除欠费(QUOTA)以外的所有错误都无限重试——
+#     内置 llm-retry 的有限重试(默认 2 次)放弃后由本插件接管,
+#     返回 { kind: 'retry' } 让 Agent 循环原地重发请求,直到成功或用户中止回合;
+#   - 指数退避:1s → 2s → 4s → ... 封顶 60s;服务端 Retry-After 优先;
+#   - 尊重回合中止信号与插件停止信号,不会在停止后继续重试。
+- insert:
+    - id: reconnect
+      name: 'dsh-reconnect'
