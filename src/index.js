@@ -1,155 +1,375 @@
-/**
- * ReConnect — 模型请求失败自动无限重试插件(Host half)。
- *
- * 原理:DSH 每次流式模型调用失败都会派发 `agent/request-error` 瀑布事件;
- * 监听器返回 `{ kind: 'retry' }` 且不调用 `next()` 时,Agent 循环会原地重发
- * 这次请求。本插件注册在瀑布末端做兜底:内置 llm-retry 的有限重试(默认 2 次,
- * 仅限 RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT/EMPTY_RESPONSE)放弃后,由我们
- * 接管,对除欠费(QUOTA)以外的所有错误无限重试,直到成功或用户中止回合。
- *
- * 退避:指数退避(1s → 2s → 4s → ... 封顶 60s),服务端 Retry-After 优先;
- * 尊重回合的中止信号与插件自身的停止信号。
- */
-export const name = 'reconnect';
-
-/** 需要 timer 服务提供可取消的退避等待。 */
-export const inject = ['timer'];
+import z from "@deepseek-ai/schemastery";
+import { settingsNamespace } from "@deepseek-ai/dsh-settings";
 
 /**
- * @param {import('cordis').Context} ctx
+ * ReConnect — 模型请求失败自动恢复(Host half)。
+ *
+ * 只处理 agent/request-error 中的模型请求失败。工具执行结果属于
+ * tool/result,不在本插件的重试边界内;即使上游把工具错误包装成未知模型错误,
+ * 未知错误是否限次由 settings 配置决定(默认无限);模型不存在或模型未配置属于
+ * 等待配置恢复的例外。
  */
-export function apply(ctx) {
-  const INITIAL_DELAY_MS = 1000;
-  const MAX_DELAY_MS = 60000;
-  const RETRY_POLICY_KEY = 'reconnect-infinite-v1';
-  // 插件停止标志:停止后不再安排新重试。
-  let alive = true;
-  let retrySequence = 0;
-  // agent -> Map(turn:step:provider -> retry-chain state);WeakMap 随 agent 回收自动清理。
-  const byAgent = new WeakMap();
+export const name = "reconnect";
+export const SETTINGS_NAMESPACE = "dsh-reconnect";
+const NS = settingsNamespace(SETTINGS_NAMESPACE);
+export const inject = ["settings"];
 
-  function copyFailure(failure, code) {
-    const snapshot = {
-      code,
-      message: failure && typeof failure.message === 'string' && failure.message.length > 0
-        ? failure.message
-        : code
+const DEFAULTS = Object.freeze({
+  maxDelayMs: 60000,
+  retryQuota: false,
+  retryUnknown: true,
+  unknownMaxRetries: 3,
+});
+
+export const Config = z.object({
+  maxDelayMs: z.number().step(1).min(1000).max(2147483647).default(DEFAULTS.maxDelayMs),
+  retryQuota: z.boolean().default(DEFAULTS.retryQuota),
+  retryUnknown: z.boolean().default(DEFAULTS.retryUnknown),
+  unknownMaxRetries: z.number().step(1).min(0).max(100).default(DEFAULTS.unknownMaxRetries),
+});
+
+// DSH 模型层标记的临时错误集合;STREAM_CLOSED 是异常流结束的传输类扩展。
+const TRANSIENT_CODES = new Set([
+  "EMPTY_RESPONSE",
+  "RATE_LIMIT",
+  "SERVER",
+  "STREAM_CLOSED",
+  "TIMEOUT",
+  "TRANSPORT",
+]);
+
+// 明确属于修复请求/执行环境的问题,不能靠重复同一个请求解决。
+const PERMANENT_CODES = new Set([
+  "ABORTED",
+  "ABORTED_BEFORE_DISPATCH",
+  "AUTH",
+  "CONTEXT_WINDOW_EXCEEDED",
+  "INVALID_ARGS",
+  "INVALID_CREDENTIAL",
+  "INVALID_REQUEST",
+  "INVALID_REPLAY_STATE",
+  "MISSING_CREDENTIAL",
+  "NO_ADAPTER",
+  "NO_TOOL",
+  "UNKNOWN_TOOL",
+  "UNSUPPORTED_CONTENT",
+  "UNSUPPORTED_OPTION",
+  "UNSUPPORTED_REASONING_EFFORT",
+]);
+
+const TOOL_ERROR_CODES = new Set([
+  "TOOL_ERROR",
+  "TOOL_OUTPUT_ERROR",
+  "TOOL_EXECUTION_ERROR",
+  "TOOL_CALL_ERROR",
+]);
+
+// 模型不存在或当前 Provider 没有配置该模型时,允许无限重试等待配置恢复。
+const MODEL_AVAILABILITY_CODES = new Set([
+  "MODEL_NOT_FOUND",
+  "MODEL_NOT_EXIST",
+  "MODEL_NOT_EXISTS",
+  "MODEL_NOT_CONFIGURED",
+  "MODEL_NOT_AVAILABLE",
+  "MODEL_UNAVAILABLE",
+  "NO_MODEL",
+  "UNKNOWN_MODEL",
+]);
+
+// pi-ai 会把部分 404 模型路由错误压成 PI_AI_ERROR,只能从其稳定的
+// provider 错误片段识别;不要把所有 PI_AI_ERROR 都当成模型可用性错误。
+const MODEL_AVAILABILITY_MESSAGE_PATTERNS = [
+  /\bmodel[_ -]?not[_ -]?found\b/i,
+  /\bmodel[_ -]?not[_ -]?(?:configured|available|exist(?:s)?)\b/i,
+  /\bmodel\b[^\r\n]{0,120}\b(?:not found|not available|unavailable)\b/i,
+  /\bunknown model\b/i,
+  /\bno configured model\b/i,
+  /\bno model(?: is)? configured\b/i,
+  /\bno such model\b/i,
+  /\bmodel\b[^\r\n]{0,120}\b(?:does not exist|doesn't exist|is not supported by any configured account|is not configured|isn't configured|not configured)\b/i,
+  /(?:模型不存在|模型未配置|未配置模型)/i,
+];
+
+function normalizeConfig(value = {}) {
+  const maxDelayMs = Number.isSafeInteger(value.maxDelayMs) && value.maxDelayMs >= 1000
+    ? Math.min(value.maxDelayMs, 2147483647)
+    : DEFAULTS.maxDelayMs;
+  const unknownMaxRetries = Number.isSafeInteger(value.unknownMaxRetries) && value.unknownMaxRetries >= 0
+    ? Math.min(value.unknownMaxRetries, 100)
+    : DEFAULTS.unknownMaxRetries;
+  return {
+    maxDelayMs,
+    retryQuota: value.retryQuota === undefined ? DEFAULTS.retryQuota : value.retryQuota === true,
+    retryUnknown: value.retryUnknown === undefined ? DEFAULTS.retryUnknown : value.retryUnknown === true,
+    unknownMaxRetries,
+  };
+}
+
+function messageOf(failure) {
+  return failure && typeof failure.message === "string" ? failure.message : "";
+}
+
+function isModelAvailabilityFailure(failure, code) {
+  if (typeof code === "string" && MODEL_AVAILABILITY_CODES.has(code.toUpperCase())) return true;
+  if (typeof code !== "string" || code.toUpperCase() !== "PI_AI_ERROR") return false;
+  return MODEL_AVAILABILITY_MESSAGE_PATTERNS.some((pattern) => pattern.test(messageOf(failure)));
+}
+
+function isPermanentFailure(failure, code) {
+  if (isModelAvailabilityFailure(failure, code)) return false;
+  return PERMANENT_CODES.has(code) || TOOL_ERROR_CODES.has(code);
+}
+
+function copyFailure(failure, code) {
+  const snapshot = {
+    code,
+    message: messageOf(failure) || code,
+  };
+  if (failure && Number.isInteger(failure.status) && failure.status >= 100 && failure.status <= 599) {
+    snapshot.status = failure.status;
+  }
+  if (failure && typeof failure.providerRetryAfterMs === "number"
+    && Number.isFinite(failure.providerRetryAfterMs) && failure.providerRetryAfterMs > 0) {
+    snapshot.providerRetryAfterMs = failure.providerRetryAfterMs;
+  }
+  if (failure && typeof failure.requestId === "string" && failure.requestId.length > 0) {
+    snapshot.requestId = failure.requestId;
+  }
+  return snapshot;
+}
+
+/** 从 durable 会话事件恢复本插件指定策略链的最后一次重试。 */
+function previousRetry(session, turn, step, provider, policyKey) {
+  const events = session && session.events;
+  if (!events || typeof events.length !== "number") return undefined;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const data = event && event.type === "llm/retry" ? event.data : undefined;
+    if (data && data.turn === turn && data.step === step && data.provider === provider
+      && data.policyKey === policyKey) {
+      return data;
+    }
+  }
+  return undefined;
+}
+
+function previousPluginRetryInScope(session, turn, step, provider) {
+  const events = session && session.events;
+  if (!events || typeof events.length !== "number") return undefined;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const data = event && event.type === "llm/retry" ? event.data : undefined;
+    if (!sameRetryScope(data, turn, step, provider)) continue;
+    return isPluginRetryData(data, turn, step, provider) ? data : undefined;
+  }
+  return undefined;
+}
+
+function sameRetryScope(data, turn, step, provider) {
+  return data && data.turn === turn && data.step === step && data.provider === provider;
+}
+
+function isPluginRetryData(data, turn, step, provider) {
+  return sameRetryScope(data, turn, step, provider)
+    && typeof data.policyKey === "string" && data.policyKey.startsWith("reconnect-");
+}
+
+function isBoundedUnknownFailure(failure, code) {
+  return typeof code === "string"
+    && !TRANSIENT_CODES.has(code)
+    && code !== "QUOTA"
+    && !isModelAvailabilityFailure(failure, code);
+}
+
+/** 统计同一模型步骤中最后一段连续未知错误,避免错误码抖动制造假上限。 */
+function previousUnknownStreak(session, turn, step, provider) {
+  const events = session && session.events;
+  if (!events || typeof events.length !== "number") return 0;
+  let streak = 0;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type !== "llm/retry") continue;
+    const data = event.data;
+    if (!sameRetryScope(data, turn, step, provider)) continue;
+    if (!isPluginRetryData(data, turn, step, provider)) break;
+    if (typeof data.policyKey !== "string" || !data.policyKey.startsWith("reconnect-unknown-normal-v4:")) break;
+    const code = data.failure && typeof data.failure.code === "string" ? data.failure.code : "UNKNOWN";
+    if (!isBoundedUnknownFailure(data.failure, code)) break;
+    streak += 1;
+  }
+  return streak;
+}
+
+/** 返回同一错误类别的策略;有限未知链的 policyKey 在调用点按连续段生成。 */
+function retryPolicyFor(code, retryUnknown, failure) {
+  if (isModelAvailabilityFailure(failure, code)) {
+    return { key: "reconnect-model-availability-v4", mode: "always" };
+  }
+  if (code === "QUOTA") {
+    return { key: "reconnect-quota-v3", mode: "always" };
+  }
+  if (TRANSIENT_CODES.has(code)) {
+    return { key: "reconnect-transient-v3", mode: "always" };
+  }
+  return retryUnknown
+    ? { key: "reconnect-unknown-always-v3", mode: "always" }
+    : { key: "reconnect-unknown-normal-v3", mode: "normal" };
+}
+
+function backoffDelay(retry, maxDelayMs) {
+  const exponent = Math.min(Math.max(retry - 1, 0), 31);
+  return Math.min(maxDelayMs, 1000 * (2 ** exponent));
+}
+
+function providerRetryAfter(failure) {
+  if (!failure || typeof failure.providerRetryAfterMs !== "number"
+    || !Number.isFinite(failure.providerRetryAfterMs) || failure.providerRetryAfterMs <= 0) {
+    return undefined;
+  }
+  return Math.min(Math.ceil(failure.providerRetryAfterMs), 2147483647);
+}
+
+/** 创建同时受回合和插件生命周期控制的退避等待。 */
+function waitForRetry(delayMs, signals) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      for (const signal of signals) signal?.removeEventListener?.("abort", finish);
+      resolve();
     };
-    if (failure && Number.isInteger(failure.status) && failure.status >= 100 && failure.status <= 599) {
-      snapshot.status = failure.status;
+    if (signals.some((signal) => signal?.aborted)) {
+      finish();
+      return;
     }
-    if (failure && typeof failure.providerRetryAfterMs === 'number'
-      && Number.isFinite(failure.providerRetryAfterMs) && failure.providerRetryAfterMs > 0) {
-      snapshot.providerRetryAfterMs = failure.providerRetryAfterMs;
-    }
-    if (failure && typeof failure.requestId === 'string' && failure.requestId.length > 0) {
-      snapshot.requestId = failure.requestId;
-    }
-    return snapshot;
+    for (const signal of signals) signal?.addEventListener?.("abort", finish, { once: true });
+    timer = setTimeout(finish, delayMs);
+  });
+}
+
+/** 安装 Host 重试监听器，并将插件配置接入宿主 settings。 */
+export function apply(ctx, config = {}) {
+  let live = normalizeConfig(config);
+  let unwatchSettings;
+  try {
+    // 第一层由 Cordis patch 提供默认值，第二层由 settings service 持久化用户覆盖。
+    const scope = ctx.settings.register(NS, Config, { base: config || {} });
+    live = normalizeConfig(scope.get());
+    unwatchSettings = scope.watch(() => {
+      live = normalizeConfig(scope.get());
+    });
+  } catch (error) {
+    console.warn(`[ReConnect] settings namespace unavailable, using composition config: ${error?.message || error}`);
+  }
+  const lifetime = new AbortController();
+  const active = new Set();
+  let alive = true;
+
+  function nextRetryId() {
+    return `reconnect-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
-  function previousRetry(agent, turn, step, provider) {
-    return agent.session.events.findLast((event) => event.type === 'llm/retry'
-      && event.data.turn === turn
-      && event.data.step === step
-      && event.data.provider === provider);
+  function track(operation) {
+    active.add(operation);
+    const remove = () => active.delete(operation);
+    operation.then(remove, remove);
+    return operation;
   }
 
-  // 插件生命周期:停止时关闭标志并卸载监听器。
   ctx.effect(() => {
-    const disposeListener = ctx.on('agent/request-error', async (payload, next) => {
+    const disposers = [];
+
+    const handleRequestError = async (payload, next) => {
       const { agent, turn, step, provider, failure, signal } = payload;
-      const code = failure && typeof failure.code === 'string' ? failure.code : 'UNKNOWN';
+      const code = failure && typeof failure.code === "string" ? failure.code : "UNKNOWN";
+      const message = messageOf(failure);
 
-      // 欠费不重试,交还瀑布默认行为(终结错误)。
-      if (code === 'QUOTA') return next();
-      // 用户中止回合或插件已停止:立即停止重试。
-      if (signal.aborted || !alive) return next();
+      if (!alive || signal?.aborted) return next();
+      // llm-retry 的 always 实现会把恢复决定交给下游 waterfall;
+      // 本插件是该链的下游恢复者,不能把普通可恢复错误直接交回终点。
+      if (isPermanentFailure(failure, code)) return next();
+      if (code === "QUOTA" && !live.retryQuota) return next();
 
-      // 按 (turn, step, provider) 追踪连续失败次数与上一轮延迟。
-      let byStep = byAgent.get(agent);
-      if (byStep === undefined) {
-        byStep = new Map();
-        byAgent.set(agent, byStep);
+      const unknown = isBoundedUnknownFailure(failure, code);
+      const policy = retryPolicyFor(code, live.retryUnknown, failure);
+      const prior = previousRetry(agent.session, turn, step, provider, policy.key);
+      const unknownStreak = unknown ? previousUnknownStreak(agent.session, turn, step, provider) : 0;
+      if (unknown && !live.retryUnknown && unknownStreak >= live.unknownMaxRetries) {
+        console.warn(`[ReConnect] ${provider} ${code} 达到未知错误重试上限(${live.unknownMaxRetries}),停止本链${message ? `: ${message.slice(0, 160)}` : ""}`);
+        return next();
       }
-      const key = `${turn}:${step}:${provider}`;
-      let entry = byStep.get(key);
-      if (entry === undefined) {
-        // 接上内置有限重试链,让 Harness 显示连续的总次数。
-        const prior = previousRetry(agent, turn, step, provider);
-        const priorData = prior && prior.data;
-        entry = {
-          count: priorData && Number.isSafeInteger(priorData.retry) ? priorData.retry : 0,
-          delay: 0,
-          retryId: priorData && typeof priorData.retryId === 'string' && priorData.retryId.length > 0
-            ? priorData.retryId
-            : `reconnect-${retrySequence++}`,
-          policyKey: priorData && typeof priorData.policyKey === 'string' && priorData.policyKey.length > 0
-            ? priorData.policyKey
-            : RETRY_POLICY_KEY
-        };
-        byStep.set(key, entry);
+      let retryPolicyForRequest = policy;
+      let retryPrior = prior;
+      if (unknown && !live.retryUnknown) {
+        const last = previousPluginRetryInScope(agent.session, turn, step, provider);
+        const lastCode = last?.failure && typeof last.failure.code === "string"
+          ? last.failure.code
+          : "UNKNOWN";
+        const sameBoundedSegment = Boolean(last)
+          && isBoundedUnknownFailure(last.failure, lastCode)
+          && typeof last.policyKey === "string"
+          && last.policyKey.startsWith("reconnect-unknown-normal-v4:");
+        // 有限未知重试只延续最后一段未知错误;中间出现其他策略后从新的 1/N 链开始。
+        if (sameBoundedSegment) {
+          retryPolicyForRequest = { ...policy, key: last.policyKey };
+          retryPrior = last;
+        } else {
+          retryPolicyForRequest = { ...policy, key: `reconnect-unknown-normal-v4:${nextRetryId()}` };
+          retryPrior = undefined;
+        }
       }
-      entry.count += 1;
-      const nextDelay = entry.delay <= 0
-        ? INITIAL_DELAY_MS
-        : entry.delay * 2 > MAX_DELAY_MS ? MAX_DELAY_MS : entry.delay * 2;
-      entry.delay = nextDelay;
+      const retryPreviousCount = retryPrior && Number.isSafeInteger(retryPrior.retry) && retryPrior.retry >= 0
+        ? retryPrior.retry
+        : 0;
+      const retry = retryPreviousCount >= Number.MAX_SAFE_INTEGER ? retryPreviousCount : retryPreviousCount + 1;
+      const retryId = retryPrior && typeof retryPrior.retryId === "string" && retryPrior.retryId.length > 0
+        ? retryPrior.retryId
+        : nextRetryId();
+      const maxDelayMs = live.maxDelayMs;
+      const waitMs = providerRetryAfter(failure) ?? backoffDelay(retry, maxDelayMs);
+      const retryMode = retryPolicyForRequest.mode;
 
-      // 服务端 Retry-After 优先(封顶 60s)。
-      let waitMs = nextDelay;
-      if (failure && typeof failure.providerRetryAfterMs === 'number'
-        && Number.isFinite(failure.providerRetryAfterMs) && failure.providerRetryAfterMs > 0) {
-        waitMs = failure.providerRetryAfterMs > MAX_DELAY_MS ? MAX_DELAY_MS : failure.providerRetryAfterMs;
-      }
-
-      // 标准 durable 事件会让 Harness 显示次数、∞、倒计时和错误原因。
-      agent.session.append('llm/retry', {
-        retryId: entry.retryId,
+      agent.session.append("llm/retry", {
+        retryId,
         turn,
         step,
         provider,
-        mode: 'always',
-        policyKey: entry.policyKey,
-        retry: entry.count,
+        mode: retryMode,
+        ...(retryMode === "normal" ? { maxRetries: live.unknownMaxRetries } : {}),
+        policyKey: retryPolicyForRequest.key,
+        retry,
         delayMs: waitMs,
-        failure: copyFailure(failure, code)
+        failure: copyFailure(failure, code),
       });
-      console.log(`[ReConnect] ${provider} ${code} 第${entry.count}次失败 → ${waitMs}ms 后重试 (turn ${turn} step ${step})`);
+      console.log(`[ReConnect] ${provider} ${code} 第${retry}次失败 → ${waitMs}ms 后重试 (turn ${turn} step ${step}, maxDelayMs=${maxDelayMs})`);
 
-      // 可中止等待:回合中止信号触发时提前结束等待。
-      await new Promise((resolve) => {
-        let settled = false;
-        let disposeTimer = null;
-        const onAbort = () => finish();
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          if (disposeTimer) {
-            try { disposeTimer(); } catch (err) { /* 定时器已解除 */ }
-          }
-          try { signal.removeEventListener('abort', onAbort); } catch (err) { /* 忽略 */ }
-          resolve();
-        };
-        try { signal.addEventListener('abort', onAbort, { once: true }); } catch (err) { /* 忽略 */ }
-        disposeTimer = ctx.timeout(finish, waitMs);
-      });
+      await waitForRetry(waitMs, [signal, lifetime.signal]);
 
-      // 等待期间被中止或插件被停止:交还瀑布(终结错误),不安排重试。
-      if (signal.aborted || !alive) return next();
-      agent.session.append('llm/retry-started', {
-        retryId: entry.retryId,
+      if (!alive || signal?.aborted || lifetime.signal.aborted) return next();
+      agent.session.append("llm/retry-started", {
+        retryId,
         turn,
         step,
-        retry: entry.count
+        retry,
       });
-      // 接管恢复:让 Agent 循环原地重发这次请求。
-      return { kind: 'retry' };
-    });
+      return { kind: "retry" };
+    };
+
+    disposers.push(ctx.on("agent/request-error", (payload, next) => {
+      return track(Promise.resolve(handleRequestError(payload, next)));
+    }));
 
     return () => {
       alive = false;
-      disposeListener();
+      lifetime.abort();
+      try { unwatchSettings?.(); } catch {}
+      for (const dispose of disposers) {
+        try { dispose(); } catch {}
+      }
+      return Promise.allSettled([...active]);
     };
-  }, 'reconnect: infinite request retry with Harness counter');
+  }, "reconnect: safe model-request recovery");
 }

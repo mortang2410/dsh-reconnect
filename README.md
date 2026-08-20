@@ -1,18 +1,18 @@
 # dsh-reconnect
 
-> Infinite model-request retry for DeepSeek Harness, with exponential backoff and relay/proxy failure recovery.
->
-> 为 DeepSeek Harness 提供模型请求无限重试、指数退避和不稳定中转站/代理恢复能力。
+> Safe model-request retry for DeepSeek Harness with exponential backoff, relay/proxy failure recovery, and a unified settings panel.
 
-## English
+**Version:** `2.0.0`
 
-### Project Description
+- [中文文档 (Chinese README)](./README_CN.md)
+
+## Project Description
 
 `dsh-reconnect` is a Host-side plugin for DeepSeek Harness (DSH). It retries failed model requests so temporary network failures do not interrupt an agent turn or a long-running task.
 
-The plugin listens to the DSH `agent/request-error` waterfall event. After the built-in finite retry handler gives up, the Agent loop sends the same request again until it succeeds or the user stops the turn.
+The plugin listens to the DSH `agent/request-error` waterfall event. After the built-in `normal` Provider retry policy gives up, or when a Provider's `always` policy delegates recovery downstream, the Agent loop sends the same request again according to this plugin's policy.
 
-### Suitable Use Cases
+## Suitable Use Cases
 
 - Unstable relay stations, reverse proxies, API gateways, or forwarding services
 - Relay nodes that disconnect, reset connections, or return incomplete responses
@@ -20,34 +20,80 @@ The plugin listens to the DSH `agent/request-error` waterfall event. After the b
 - Temporary provider outages, server-side 5xx errors, rate limits, and timeouts
 - Long-running tasks that should survive short-lived provider or network failures
 
-### Retry Policy
+## Retry Policy
 
 | Condition | Behavior |
 | --- | --- |
-| `QUOTA` (insufficient balance or exhausted quota) | Do not retry |
-| Any other model-request error | Retry indefinitely until success or cancellation |
+| `EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` / `STREAM_CLOSED` / `TIMEOUT` / `TRANSPORT` | Retry indefinitely (transient connection/service failures) |
+| Model missing or not configured (`MODEL_NOT_FOUND`, `MODEL_NOT_CONFIGURED`, or matching Provider text) | Retry indefinitely while waiting for model/account configuration to recover |
+| `QUOTA` (insufficient balance or exhausted quota) | Do not retry by default; retried when `retryQuota: true` |
+| Unknown errors such as `PI_AI_ERROR` | Retry indefinitely by default; disable `retryUnknown` to apply the configurable consecutive-failure cap |
+| Tool/argument/unknown-tool/auth/credential/context-overflow/aborted | Never retried; step ends immediately |
 
-Permanent authentication, configuration, or context errors may continue retrying. Stop the current turn manually when such an error cannot recover.
+Key design points:
 
-### Backoff and Cancellation
+- Only retries failures that "resending the same request" can fix — dropped connections, rate limits, timeouts, 5xx.
+- Tool execution errors (`tool/result`) are outside this plugin's retry boundary. Error routing uses the machine code from `agent/request-error`, rather than guessing from message text; an unknown machine code uses the configured unknown-error path (bounded only when `retryUnknown` is disabled).
+- Permanent errors (credentials, request content, context overflow) stop immediately; missing or unconfigured models are the deliberate exception and keep retrying while configuration recovers.
+- `retryQuota` and `retryUnknown` control this plugin's fallback chain. The Host `always` policy delegates recovery to downstream waterfall listeners, so this plugin handles the recoverable failure categories once and does not create a second parallel retry loop.
 
-- Exponential backoff: `1s -> 2s -> 4s -> ...`, capped at `60s`
-- Honors `providerRetryAfterMs` when available, also capped at `60s`
+## Backoff and Cancellation
+
+- Exponential backoff: `1s -> 2s -> 4s -> ...`, capped at `60s` by default (the settings panel offers 1/2/5/10/30/60/120 seconds or a custom value; `maxDelayMs` overrides in milliseconds)
+- Honors a positive `providerRetryAfterMs` when available. It is a provider minimum wait and is not capped by the local exponential-backoff limit; only the Node timer maximum applies.
 - Logs the provider, error code, turn, step, retry count, and delay
-- Emits standard `llm/retry` events so the Harness conversation UI shows the continuous retry count, `∞` limit, countdown, and failure reason
-- Stops when the current turn is aborted or the plugin is stopped
+- Emits standard `llm/retry` events so the Harness conversation UI shows the continuous retry count and countdown
+- Stops when the current turn is aborted, the plugin is stopped, or the plugin is hot-reloaded; active waits are drained during cleanup.
 
-### Download
+## Visual Configuration
+
+Open Settings → Plugin configuration. ReConnect is shown as a plugin card in that page:
+
+- **Max wait per attempt**: drop-down presets (1/2/5/10/30/60/120 seconds) or a custom value
+- **Retry on quota**: toggle, off by default
+- **Retry unknown errors indefinitely**: toggle, on by default
+- **Max retries for unknown errors**: default 3. Missing or unconfigured model errors are not subject to this cap and always retry.
+
+Changes take effect immediately without restarting DSH.
+
+## YAML Configuration
+
+The plugin accepts optional values in its Cordis row config:
+
+- `maxDelayMs` (integer milliseconds, default `60000`): caps the local exponential-backoff delay; for example `15000` produces `1s -> 2s -> 4s -> 8s -> 15s -> 15s...` indefinitely. A positive Provider `Retry-After` remains authoritative.
+- `retryQuota` (boolean, default `false`): whether `QUOTA` errors are also retried.
+- `retryUnknown` (boolean, default `true`): whether unknown errors are retried indefinitely.
+- `unknownMaxRetries` (integer, default `3`): bounded cap for consecutive unknown failures in the same model step; missing or unconfigured model errors do not use this cap.
+
+The settings service persists the plugin card values. **Restore defaults** removes the user overrides and immediately returns to the schema/Cordis defaults; a restart is not required.
+
+The plugin's own retry policy is the downstream recovery for both Provider `normal` and `always` policies. The two layers do not multiply retries: `normal` schedules only its configured codes before this plugin, while `always` delegates the decision downstream.
+
+`maxDelayMs` caps the local exponential wait, **not** a Provider `Retry-After` value and not the total retry duration.
+
+```yaml
+- insert:
+    - id: reconnect
+      name: dsh-reconnect
+      config:
+        maxDelayMs: 15000
+        retryQuota: false
+        retryUnknown: true
+```
+
+Invalid or missing `maxDelayMs` values fall back to `60000`.
+
+## Download
 
 The package is platform-independent. Choose one of the following methods.
 
-#### Method 1: GitHub Web Download
+### Method 1: GitHub Web Download
 
 1. Open https://github.com/MistRain-1/dsh-reconnect.
 2. Select **Code** and then **Download ZIP**.
 3. Extract the archive and use the extracted `dsh-reconnect-main` directory as the plugin package.
 
-#### Method 2: Git Clone
+### Method 2: Git Clone
 
 Windows PowerShell:
 
@@ -67,7 +113,7 @@ Linux:
 git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME/dsh-reconnect"
 ```
 
-#### Method 3: Download the ZIP from a Terminal
+### Method 3: Download the ZIP from a Terminal
 
 Windows PowerShell:
 
@@ -98,115 +144,13 @@ After downloading, register the package in the DSH Cordis composition:
       name: dsh-reconnect
 ```
 
-Restart DSH after installing a persistent plugin package.
+A DSH restart is required after installing the persistent plugin package.
 
-### Runtime Requirements
+## Requirements
 
-- Host-side DSH plugin
-- `timer` Service and `agent/request-error` waterfall event
-- No Client-side UI, external network requests, or credential access
-
-## 中文
-
-### 项目简介
-
-`dsh-reconnect` 是一个 DeepSeek Harness (DSH) Host 端插件。模型请求失败时,插件会自动重新发送请求,避免临时网络故障、中转站不稳定或服务端波动导致 Agent 回合中断。
-
-插件监听 DSH 的 `agent/request-error` 瀑布事件。内置有限重试策略放弃后,Agent 循环会重新发送同一个请求,直到请求成功或用户停止回合。
-
-### 适用场景
-
-- 不稳定的中转站、反向代理、API 网关或转发服务
-- 中转节点偶发断开、重置连接或返回不完整响应
-- 网络抖动、传输错误和连接超时
-- 模型服务临时不可用、5xx 错误、限流或过载
-- 需要长时间运行且不能被短暂故障打断的任务
-
-### 重试策略
-
-| 情况 | 处理 |
-| --- | --- |
-| `QUOTA`(余额不足或额度耗尽) | 不重试 |
-| 其他模型请求错误 | 无限重试,直到成功或取消 |
-
-永久性的凭据、配置或上下文错误可能持续重试。遇到无法恢复的错误时,请手动停止当前回合。
-
-### 退避与停止
-
-- 指数退避: `1s -> 2s -> 4s -> ...`,最长等待 `60s`
-- 如果服务端提供 `providerRetryAfterMs`,优先使用该等待时间,同样封顶 `60s`
-- 记录 Provider、错误码、回合、步骤、重试次数和等待时间
-- 写入标准 `llm/retry` 事件,Harness 会话界面显示连续重试次数、`∞`、倒计时和错误原因
-- 用户停止回合或插件停止后立即停止重试
-
-### 下载方式
-
-本插件与操作系统无关,可以选择以下任意一种方式下载。
-
-#### 方式一:GitHub 网页下载
-
-1. 打开 https://github.com/MistRain-1/dsh-reconnect。
-2. 点击 **Code**,再点击 **Download ZIP**。
-3. 解压后,将 `dsh-reconnect-main` 目录作为插件包使用。
-
-#### 方式二:Git 克隆
-
-Windows PowerShell:
-
-```powershell
-git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME\dsh-reconnect"
-```
-
-macOS:
-
-```bash
-git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME/dsh-reconnect"
-```
-
-Linux:
-
-```bash
-git clone https://github.com/MistRain-1/dsh-reconnect.git "$HOME/dsh-reconnect"
-```
-
-#### 方式三:命令行下载 ZIP
-
-Windows PowerShell:
-
-```powershell
-Invoke-WebRequest -Uri https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -OutFile dsh-reconnect.zip
-Expand-Archive -Path dsh-reconnect.zip -DestinationPath .
-```
-
-macOS:
-
-```bash
-curl -L https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -o dsh-reconnect.zip
-unzip dsh-reconnect.zip
-```
-
-Linux:
-
-```bash
-wget https://github.com/MistRain-1/dsh-reconnect/archive/refs/heads/main.zip -O dsh-reconnect.zip
-unzip dsh-reconnect.zip
-```
-
-下载完成后,将插件加入 DSH 的 Cordis 组合:
-
-```yaml
-- insert:
-    - id: reconnect
-      name: dsh-reconnect
-```
-
-安装持久插件包后需要重启 DSH。
-
-### 运行要求
-
-- DSH Host 端插件
-- 使用 `timer` Service 和 `agent/request-error` 瀑布事件
-- 无 Client 端 UI,不发起额外外部网络请求,不读取凭据
+- DSH Host plugin
+- Uses the `agent/request-error` waterfall event and the Host settings service
+- Client side provides a unified-format settings card and never reads credentials
 
 ## License
 
