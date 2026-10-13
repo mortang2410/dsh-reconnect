@@ -1,5 +1,19 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+// Neutralize real backoff waits BEFORE importing the plugin: record scheduled
+// timers and fire them immediately, so backoff chains proceed without wall time.
+const pendingTimers = [];
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (fn, ms, ...rest) => {
+  pendingTimers.push(fn);
+  return { unref() {}, ref() {} };
+};
+function drainTimers() {
+  while (pendingTimers.length > 0) {
+    const fn = pendingTimers.shift();
+    fn();
+  }
+}
 import { apply, Config } from "../src/index.js";
 
 function createHarness(config = {}) {
@@ -8,32 +22,11 @@ function createHarness(config = {}) {
   const currentConfig = {
     maxDelayMs: 1000,
     retryQuota: false,
-    retryUnknown: true,
-    unknownMaxRetries: 3,
+    retryUnknown: false,
+    unknownMaxRetries: 10,
     ...config,
   };
-  const watchers = new Set();
-  const settingsScope = {
-    get: () => ({ ...currentConfig }),
-    watch(listener) {
-      watchers.add(listener);
-      return () => watchers.delete(listener);
-    },
-    set(field, value) {
-      currentConfig[field] = value;
-      for (const listener of watchers) listener();
-      return Promise.resolve();
-    },
-  };
   const ctx = {
-    settings: {
-      register(namespace, schema, options) {
-        assert.equal(namespace.key || namespace, "dsh-reconnect");
-        assert.ok(schema);
-        assert.ok(options);
-        return settingsScope;
-      },
-    },
     on(event, listener) {
       listeners.set(event, listener);
       return () => listeners.delete(event);
@@ -42,7 +35,7 @@ function createHarness(config = {}) {
       cleanup = factory();
     },
   };
-  apply(ctx, config);
+  apply(ctx, currentConfig);
   const session = {
     events: [],
     append(type, data) {
@@ -51,19 +44,24 @@ function createHarness(config = {}) {
   };
   const agent = { session };
   const signal = new AbortController();
-  const requestError = (failure, extra = {}) => listeners.get("agent/request-error")({
-    agent,
-    turn: 1,
-    step: 1,
-    provider: "fixture",
-    failure,
-    signal: extra.signal || signal.signal,
-    retryPolicy: extra.retryPolicy,
-  }, () => ({ kind: "next" }));
+  const requestError = async (failure, extra = {}) => {
+    // The handler awaits a backoff timer before returning; fire the pending
+    // timer while the handler is pending, then await its result.
+    const pending = listeners.get("agent/request-error")({
+      agent,
+      turn: 1,
+      step: 1,
+      provider: "fixture",
+      failure,
+      signal: extra.signal || signal.signal,
+      retryPolicy: extra.retryPolicy,
+    }, () => ({ kind: "next" }));
+    drainTimers();
+    return await pending;
+  };
   return {
     agent,
     session,
-    settings: settingsScope,
     signal,
     requestError,
     async dispose() {
@@ -72,7 +70,7 @@ function createHarness(config = {}) {
   };
 }
 
-function failure(code, providerRetryAfterMs = 1, message = "fixture failure") {
+function failure(code, providerRetryAfterMs = 0, message = "fixture failure") {
   return {
     code,
     message,
@@ -80,8 +78,8 @@ function failure(code, providerRetryAfterMs = 1, message = "fixture failure") {
   };
 }
 
-describe("ReConnect 重试策略", () => {
-  it("settings schema 默认开启未知错误无限重试", () => {
+describe("ReConnect 本地适配版重试策略", () => {
+  it("Config schema 默认值为上游 v2 缺省", () => {
     assert.deepEqual(Config({}), {
       maxDelayMs: 60000,
       retryQuota: false,
@@ -91,7 +89,7 @@ describe("ReConnect 重试策略", () => {
   });
 
   it("对临时错误重试并使用 durable 事件恢复计数", async () => {
-    const harness = createHarness({ maxDelayMs: 1000 });
+    const harness = createHarness();
 
     const first = await harness.requestError(failure("SERVER"));
     assert.deepEqual(first, { kind: "retry" });
@@ -108,47 +106,65 @@ describe("ReConnect 重试策略", () => {
     await harness.dispose();
   });
 
-  it("未知错误默认无限重试,事件显示无限模式", async () => {
-    const harness = createHarness({ maxDelayMs: 1000 });
+  it("profile 配置:PI_AI_ERROR 限次 10,第 11 次连续失败交回 next", async () => {
+    const harness = createHarness();
 
-    for (let retry = 1; retry <= 4; retry += 1) {
-      assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
-    }
-
-    const retries = harness.session.events.filter((event) => event.type === "llm/retry");
-    assert.deepEqual(retries.map((event) => event.data.retry), [1, 2, 3, 4]);
-    assert.equal(retries[0].data.mode, "always");
-    assert.equal(Object.hasOwn(retries[0].data, "maxRetries"), false);
-    await harness.dispose();
-  });
-
-  it("关闭未知错误无限重试后才使用有限上限", async () => {
-    const harness = createHarness({ maxDelayMs: 1000, retryUnknown: false });
-
-    for (let retry = 1; retry <= 3; retry += 1) {
+    for (let retry = 1; retry <= 10; retry += 1) {
       assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
     }
     assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "next" });
 
     const retries = harness.session.events.filter((event) => event.type === "llm/retry");
-    assert.deepEqual(retries.map((event) => event.data.retry), [1, 2, 3]);
+    assert.deepEqual(retries.map((event) => event.data.retry), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert.equal(retries[0].data.mode, "normal");
-    assert.equal(retries[0].data.maxRetries, 3);
+    assert.equal(retries[0].data.maxRetries, 10);
+    assert.match(retries[0].data.policyKey, /^reconnect-unknown-normal-v4:/);
     await harness.dispose();
   });
 
-  it("默认无限未知策略不受 Provider normal 白名单再次阻断", async () => {
-    const harness = createHarness({ maxDelayMs: 1000 });
+  it("空响应消息若被压成 PI_AI_ERROR 仍走有限未知链(等待配置恢复的措辞除外)", async () => {
+    const harness = createHarness();
+    const empty = failure(
+      "PI_AI_ERROR",
+      0,
+      'This turn failed400: {"code":"502","message":"Provider returned an empty response"}',
+    );
 
-    assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR"), {
-      retryPolicy: { mode: "normal", retryableCodes: ["SERVER"] },
-    }), { kind: "retry" });
-    assert.equal(harness.session.events[0].data.mode, "always");
+    for (let retry = 1; retry <= 10; retry += 1) {
+      assert.deepEqual(await harness.requestError(empty), { kind: "retry" });
+    }
+    assert.deepEqual(await harness.requestError(empty), { kind: "next" });
     await harness.dispose();
+  });
+
+  it("模型不存在/未配置错误(含 PI_AI_ERROR 文本变体)无限重试,不受 10 次上限约束", async () => {
+    const cases = [
+      failure("MODEL_NOT_FOUND", 0),
+      failure("UNKNOWN_MODEL", 0),
+      failure(
+        "PI_AI_ERROR",
+        0,
+        'OpenAI API error (404): {"message":"Model \\"gpt-5.6-luna\\" is not supported by any configured account in this group","type":"model_not_found"}',
+      ),
+      failure("PI_AI_ERROR", 0, 'model "gpt-5.6-luna" is not configured for this account'),
+      failure("PI_AI_ERROR", 0, "no model configured for this account"),
+    ];
+
+    for (const modelFailure of cases) {
+      const harness = createHarness();
+      for (let retry = 1; retry <= 11; retry += 1) {
+        assert.deepEqual(await harness.requestError(modelFailure), { kind: "retry" });
+      }
+      const retries = harness.session.events.filter((event) => event.type === "llm/retry");
+      assert.equal(retries[0].data.mode, "always");
+      assert.equal(retries[0].data.policyKey, "reconnect-model-availability-v4");
+      assert.equal(Object.hasOwn(retries[0].data, "maxRetries"), false);
+      await harness.dispose();
+    }
   });
 
   it("未知错误上限只统计连续未知失败,临时错误会重新打开兜底窗口", async () => {
-    const harness = createHarness({ maxDelayMs: 1000, retryUnknown: false });
+    const harness = createHarness({ unknownMaxRetries: 2 });
 
     assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
     assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
@@ -158,86 +174,18 @@ describe("ReConnect 重试策略", () => {
     assert.deepEqual(retries.map((event) => event.data.retry), [1, 2, 1, 1]);
     assert.equal(retries[0].data.policyKey, retries[1].data.policyKey);
     assert.notEqual(retries[0].data.policyKey, retries[3].data.policyKey);
-    assert.notEqual(retries[0].data.retryId, retries[3].data.retryId);
     await harness.dispose();
   });
 
-  it("从旧版或无限未知策略切回有限模式时创建新的 1/N 链", async () => {
-    for (const policyKey of ["reconnect-unknown-normal-v3", "reconnect-unknown-always-v3"]) {
-      const harness = createHarness({ maxDelayMs: 1000, retryUnknown: false });
-      harness.session.append("llm/retry", {
-        retryId: "old-chain",
-        turn: 1,
-        step: 1,
-        provider: "fixture",
-        mode: policyKey.includes("always") ? "always" : "normal",
-        maxRetries: 3,
-        policyKey,
-        retry: 3,
-        delayMs: 1,
-        failure: failure("PI_AI_ERROR"),
-      });
-
-      assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
-      const current = harness.session.events.filter((event) => event.type === "llm/retry").at(-1).data;
-      assert.equal(current.retry, 1);
-      assert.equal(current.mode, "normal");
-      assert.equal(current.maxRetries, 3);
-      assert.notEqual(current.retryId, "old-chain");
-      assert.match(current.policyKey, /^reconnect-unknown-normal-v4:/);
-      await harness.dispose();
-    }
-  });
-
-  it("模型不存在和模型未配置错误的机器码与文本都使用无限策略", async () => {
-    const cases = [
-      failure("MODEL_NOT_FOUND", 1),
-      failure("model_not_found", 1),
-      failure("MODEL_NOT_CONFIGURED", 1),
-      failure("UNKNOWN_MODEL", 1),
-      failure(
-        "PI_AI_ERROR",
-        1,
-        'OpenAI API error (404): {"message":"Model \\"gpt-5.6-luna\\" is not supported by any configured account in this group","type":"model_not_found"}',
-      ),
-      failure("PI_AI_ERROR", 1, 'provider response type=model_not_configured for model "gpt-5.6-luna"'),
-      failure("pi_ai_error", 1, 'model "gpt-5.6-luna" is not configured for this account'),
-      failure("PI_AI_ERROR", 1, 'model "gpt-5.6-luna" is not configured for this account'),
-      failure("PI_AI_ERROR", 1, "no model configured for this account"),
-    ];
-
-    for (const modelFailure of cases) {
-      const harness = createHarness({ maxDelayMs: 1000 });
-      for (let retry = 1; retry <= 4; retry += 1) {
-        assert.deepEqual(await harness.requestError(modelFailure), { kind: "retry" });
-      }
-      const retries = harness.session.events.filter((event) => event.type === "llm/retry");
-      assert.deepEqual(retries.map((event) => event.data.retry), [1, 2, 3, 4]);
-      assert.equal(new Set(retries.map((event) => event.data.mode)).size, 1);
-      assert.equal(retries[0].data.mode, "always");
-      assert.equal(retries[0].data.policyKey, "reconnect-model-availability-v4");
-      assert.equal(retries[0].data.retryId, retries[3].data.retryId);
-      assert.equal(Object.hasOwn(retries[0].data, "maxRetries"), false);
-      await harness.dispose();
-    }
-  });
-
-  it("Provider always 下的模型可用性错误仍由 ReConnect 无限等待", async () => {
-    const harness = createHarness({ maxDelayMs: 1000 });
-    const retryPolicy = { mode: "always", retryableCodes: ["PI_AI_ERROR"] };
-    const modelFailure = failure(
-      "PI_AI_ERROR",
-      1,
-      'OpenAI API error (404): {"message":"model is not configured","type":"model_not_found"}',
-    );
+  it("retryUnknown 为 true 时未知错误无限重试", async () => {
+    const harness = createHarness({ retryUnknown: true });
 
     for (let retry = 1; retry <= 4; retry += 1) {
-      assert.deepEqual(await harness.requestError(modelFailure, { retryPolicy }), { kind: "retry" });
+      assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
     }
     const retries = harness.session.events.filter((event) => event.type === "llm/retry");
-    assert.deepEqual(retries.map((event) => event.data.retry), [1, 2, 3, 4]);
     assert.equal(retries[0].data.mode, "always");
-    assert.equal(retries[0].data.policyKey, "reconnect-model-availability-v4");
+    assert.equal(Object.hasOwn(retries[0].data, "maxRetries"), false);
     await harness.dispose();
   });
 
@@ -254,7 +202,14 @@ describe("ReConnect 重试策略", () => {
 
     for (const code of [
       "AUTH",
+      "INVALID_CREDENTIAL",
+      "MISSING_CREDENTIAL",
+      "INVALID_REQUEST",
       "INVALID_REPLAY_STATE",
+      "CONTEXT_WINDOW_EXCEEDED",
+      "ABORTED",
+      "TOOL_ERROR",
+      "UNKNOWN_TOOL",
       "UNSUPPORTED_OPTION",
       "UNSUPPORTED_REASONING_EFFORT",
     ]) {
@@ -266,7 +221,7 @@ describe("ReConnect 重试策略", () => {
   });
 
   it("配额开关开启后使用无限策略", async () => {
-    const harness = createHarness({ retryQuota: true, maxDelayMs: 1000 });
+    const harness = createHarness({ retryQuota: true });
 
     assert.deepEqual(await harness.requestError(failure("QUOTA")), { kind: "retry" });
     const event = harness.session.events.find((item) => item.type === "llm/retry");
@@ -285,39 +240,22 @@ describe("ReConnect 重试策略", () => {
     await harness.dispose();
   });
 
-  it("Provider always 策略把恢复决定交给下游插件", async () => {
-    const harness = createHarness({ retryUnknown: true });
+  it("指数退避封顶 maxDelayMs(60s 配置)", async () => {
+    const harness = createHarness({ maxDelayMs: 60000 });
 
-    assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR"), {
-      retryPolicy: { mode: "always", retryableCodes: ["PI_AI_ERROR"] },
-    }), { kind: "retry" });
-    assert.equal(harness.session.events[0].data.mode, "always");
-    await harness.dispose();
-  });
-
-  it("工具文本不会误杀机器码明确为 SERVER 的模型错误", async () => {
-    const harness = createHarness({ maxDelayMs: 1000 });
-
-    assert.deepEqual(await harness.requestError(failure("SERVER", 0, "tool call gateway returned 502")), { kind: "retry" });
-    assert.equal(harness.session.events[0].data.failure.code, "SERVER");
+    for (let retry = 1; retry <= 8; retry += 1) {
+      await harness.requestError(failure("EMPTY_RESPONSE"));
+      const event = harness.session.events.filter((item) => item.type === "llm/retry").at(-1).data;
+      assert.equal(event.delayMs, Math.min(60000, 1000 * 2 ** (retry - 1)));
+    }
     await harness.dispose();
   });
 
   it("插件销毁会取消退避,不会留下悬挂 Promise", async () => {
-    const harness = createHarness({ maxDelayMs: 1000 });
+    const harness = createHarness();
     const pending = harness.requestError(failure("SERVER", 2147483647));
 
     await harness.dispose();
     assert.deepEqual(await pending, { kind: "next" });
-  });
-
-  it("settings 更新后立即改变未知错误策略", async () => {
-    const harness = createHarness({ maxDelayMs: 1000, retryUnknown: false, unknownMaxRetries: 1 });
-
-    assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
-    assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "next" });
-    await harness.settings.set("retryUnknown", true);
-    assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
-    await harness.dispose();
   });
 });

@@ -1,17 +1,25 @@
-# dsh-reconnect 补丁:向 profile 插入 reconnect 行。
+# dsh-reconnect (local adaptation) bundle patch: insert the reconnect row.
 #
 # Host half (src/index.js):
-#   - 监听 `agent/request-error` 瀑布事件(每次模型请求失败都会触发);
-#   - 内置 llm-retry 在 normal Provider 策略耗尽后由本插件接管标准临时错误和未知错误;
-#     Provider 的 always 策略把恢复决定委托给下游,由本插件处理可恢复错误;
-#   - 标准临时错误、模型不存在/未配置错误和默认未知错误无限重试,QUOTA 默认不重试;
-#   - 指数退避:1s → 2s → 4s → ... 封顶 60s;服务端 Retry-After 作为最短等待直接尊重;
-#   - 回合中止、插件销毁或热重载时立即取消等待,不会留下悬挂 Promise。
+#   - listens on the `agent/request-error` waterfall (fired on every failed
+#     model request, after llm-retry's normal policy is exhausted and when a
+#     Provider `always` policy delegates recovery downstream);
+#   - transient codes retry indefinitely; unknown codes are bounded by
+#     unknownMaxRetries when retryUnknown is false; QUOTA is not retried by
+#     default; permanent codes stop immediately; model-availability waits for
+#     configuration recovery;
+#   - exponential backoff 1s, 2s, 4s ... capped at maxDelayMs (60s);
+#     a positive provider Retry-After is honored as a floor.
+#   - cancel: turn abort, plugin stop, or hot reload drains active retries.
+#
+# Upstream MistRain-1/dsh-reconnect 2.0.0 declared this same row inside a
+# `version:`-nested patch file its README described; this file uses the
+# current `insert:` dialect the 0.2.0-rc.2 loader applies.
 - insert:
     - id: reconnect
-      name: 'dsh-reconnect'
+      name: dsh-reconnect
       config:
-        maxDelayMs: 60000
+        retryUnknown: false
+        unknownMaxRetries: 10
         retryQuota: false
-        retryUnknown: true
-        unknownMaxRetries: 3
+        maxDelayMs: 60000

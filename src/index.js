@@ -1,18 +1,21 @@
 import z from "@deepseek-ai/schemastery";
-import { settingsNamespace } from "@deepseek-ai/dsh-settings";
 
 /**
  * ReConnect — 模型请求失败自动恢复(Host half)。
  *
+ * 本地适配版:基于 MistRain-1/dsh-reconnect 2.0.0,适配 dsh 0.2.0-rc.2。
+ * 与上游的差异仅在配置来源:已发布的 @deepseek-ai/dsh-settings 没有
+ * settingsNamespace API,settings 服务也不提供 ctx.settings.register,
+ * 因此这里删除了 settings 注册层,实时配置直接来自 Cordis 行配置
+ * (profile patch,可在 Settings 的插件配置编辑器或 cordis.patch.yml 修改,
+ * 重启生效)。
+ *
  * 只处理 agent/request-error 中的模型请求失败。工具执行结果属于
- * tool/result,不在本插件的重试边界内;即使上游把工具错误包装成未知模型错误,
- * 未知错误是否限次由 settings 配置决定(默认无限);模型不存在或模型未配置属于
+ * tool/result,不在本插件的重试边界内;模型不存在或模型未配置属于
  * 等待配置恢复的例外。
  */
 export const name = "reconnect";
-export const SETTINGS_NAMESPACE = "dsh-reconnect";
-const NS = settingsNamespace(SETTINGS_NAMESPACE);
-export const inject = ["settings"];
+export const inject = [];
 
 const DEFAULTS = Object.freeze({
   maxDelayMs: 60000,
@@ -250,20 +253,9 @@ function waitForRetry(delayMs, signals) {
   });
 }
 
-/** 安装 Host 重试监听器，并将插件配置接入宿主 settings。 */
+/** 安装 Host 重试监听器(配置仅来自 Cordis 行配置)。 */
 export function apply(ctx, config = {}) {
-  let live = normalizeConfig(config);
-  let unwatchSettings;
-  try {
-    // 第一层由 Cordis patch 提供默认值，第二层由 settings service 持久化用户覆盖。
-    const scope = ctx.settings.register(NS, Config, { base: config || {} });
-    live = normalizeConfig(scope.get());
-    unwatchSettings = scope.watch(() => {
-      live = normalizeConfig(scope.get());
-    });
-  } catch (error) {
-    console.warn(`[ReConnect] settings namespace unavailable, using composition config: ${error?.message || error}`);
-  }
+  const live = normalizeConfig(config);
   const lifetime = new AbortController();
   const active = new Set();
   let alive = true;
@@ -365,7 +357,6 @@ export function apply(ctx, config = {}) {
     return () => {
       alive = false;
       lifetime.abort();
-      try { unwatchSettings?.(); } catch {}
       for (const dispose of disposers) {
         try { dispose(); } catch {}
       }
